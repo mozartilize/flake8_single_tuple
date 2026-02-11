@@ -1,0 +1,13 @@
+[package]
+name = "flake8-single-tuple"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# The name must match the module name used in your Python code
+name = "rust_tuple_scanner"
+crate-type = ["cdylib"]
+
+[dependencies]
+# PyO3 provides the bindings between Rust and Python
+pyo3 = { version = "0.20", features = ["extension-module"] }
