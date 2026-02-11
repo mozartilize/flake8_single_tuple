@@ -1,0 +1,21 @@
+[project]
+name = "flake8-single-tuple"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = ["flake8"]
+
+[project.entry-points."flake8.extension"]
+STC = "flake8_single_tuple.plugin:SingleTupleChecker"
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.uv.sources]
+flake8-single-tuple = { workspace = true, editable = true }
+
+[dependency-groups]
+dev = [
+    "flake8-single-tuple",
+]
