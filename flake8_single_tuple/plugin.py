@@ -1,30 +1,22 @@
 import ast
 
-
 class SingleTupleChecker:
     name = "flake8-single-tuple"
-    version = "1.3.0"
+    version = "1.3.2"
     STC001 = "STC001 single-item tuple missing trailing comma; did you mean `(x,)`?"
 
     def __init__(self, tree, lines):
         self.tree = tree
-        self.lines = lines  # A list of strings, one per line
+        self.lines = lines
 
     def run(self):
-        # Build parent map and collect candidate nodes in a single pass
-        # This is more efficient than calling ast.walk multiple times
-        parents = {}
-        for parent in ast.walk(self.tree):
-            for child in ast.iter_child_nodes(parent):
-                parents[child] = parent
+        parents = {child: parent for parent in ast.walk(self.tree) for child in ast.iter_child_nodes(parent)}
 
         for node in ast.walk(self.tree):
-            # Focus on expression nodes that could be wrapped in parens
             if not isinstance(node, (ast.Constant, ast.Name, ast.Attribute, ast.Subscript, ast.Call)):
                 continue
 
             parent = parents.get(node)
-            # Ignore control flow/logical groupings
             if isinstance(parent, (ast.If, ast.While, ast.Assert, ast.Return, ast.Yield, 
                                    ast.BinOp, ast.UnaryOp, ast.BoolOp, ast.With)):
                 continue
@@ -32,80 +24,75 @@ class SingleTupleChecker:
             if self._is_violation(node, parent):
                 yield (node.lineno, node.col_offset, self.STC001, type(self))
 
-    def _get_char(self, lineno, col):
-        """Safely get a character from the lines list."""
+    def _get_char_at(self, lineno, col):
         try:
-            return self.lines[lineno - 1][col]
-        except (IndexError, AttributeError):
-            return ""
-
-    def _is_violation(self, node, parent):
-        try:
-            # 1. Find the character immediately before the node
-            # We look for a '(' while skipping whitespace
-            curr_line = node.lineno
-            curr_col = node.col_offset - 1
-            
-            while curr_line >= 1:
-                char = self._get_char(curr_line, curr_col)
-                if char in " \t\n\r":
-                    curr_col -= 1
-                    if curr_col < 0:
-                        curr_line -= 1
-                        if curr_line >= 1:
-                            curr_col = len(self.lines[curr_line - 1]) - 1
-                    continue
-                break
-            
-            left_paren = char == '('
-            if not left_paren:
-                return False
-
-            # 2. Find the character immediately after the node
-            end_line = getattr(node, 'end_lineno', node.lineno)
-            end_col = getattr(node, 'end_col_offset', node.col_offset)
-            
-            curr_line = end_line
-            curr_col = end_col
-            while curr_line <= len(self.lines):
-                char = self._get_char(curr_line, curr_col)
-                if char in " \t\n\r":
-                    curr_col += 1
-                    if curr_col >= len(self.lines[curr_line - 1]):
-                        curr_line += 1
-                        curr_col = 0
-                    continue
-                break
-            
-            right_paren = char == ')'
-            if not right_paren:
-                return False
-
-            # 3. Contextual check for comma
-            # Check the span between the parens for a comma
-            # Membership/Assignment (x = ("a") or x in ("a"))
-            is_comp_assign = (isinstance(parent, (ast.Assign, ast.AnnAssign)) and node == parent.value) or \
-                             (isinstance(parent, ast.Compare) and any(node == c for c in parent.comparators))
-            
-            if is_comp_assign:
-                return not self._span_has_comma(node.lineno, node.col_offset, end_line, end_col)
-
-            # Call argument check: func((x))
-            if isinstance(parent, ast.Call) and node in parent.args:
-                # We'd need to check for a second set of parens here similar to logic above
-                # For brevity, this follows the 'double-wrap' rule
-                return not self._span_has_comma(node.lineno, node.col_offset, end_line, end_col)
-
+            if 1 <= lineno <= len(self.lines):
+                line = self.lines[lineno - 1]
+                if 0 <= col < len(line):
+                    return line[col]
         except Exception:
             pass
+        return None
+
+    def _seek(self, lineno, col, direction):
+        """Moves through self.lines skipping whitespace to find the next char."""
+        curr_l, curr_c = lineno, col
+        while 1 <= curr_l <= len(self.lines):
+            char = self._get_char_at(curr_l, curr_c)
+            
+            if char is None: # We hit end of line or start of line
+                if direction > 0:
+                    curr_l += 1
+                    curr_c = 0
+                else:
+                    curr_l -= 1
+                    if curr_l >= 1:
+                        curr_c = len(self.lines[curr_l - 1]) - 1
+                continue
+            
+            if char in " \t\n\r":
+                curr_c += direction
+                continue
+            
+            return char, curr_l, curr_c
+        return None, curr_l, curr_c
+
+    def _is_violation(self, node, parent):
+        # 1. Look for immediate inner parentheses (x)
+        char_l, l_line, l_col = self._seek(node.lineno, node.col_offset - 1, -1)
+        
+        end_lineno = getattr(node, "end_lineno", node.lineno)
+        end_col = getattr(node, "end_col_offset", node.col_offset)
+        char_r, r_line, r_col = self._seek(end_lineno, end_col, 1)
+
+        if char_l != '(' or char_r != ')':
+            return False
+
+        # 2. Context Logic
+        is_call_arg = isinstance(parent, ast.Call) and node in parent.args
+        is_comp_assign = (isinstance(parent, (ast.Assign, ast.AnnAssign)) and node == parent.value) or \
+                         (isinstance(parent, ast.Compare) and any(node == c for c in parent.comparators))
+
+        # For function calls: func((x)) -> we need to find a SECOND set of parens
+        if is_call_arg:
+            outer_l, _, _ = self._seek(l_line, l_col - 1, -1)
+            outer_r, _, _ = self._seek(r_line, r_col + 1, 1)
+            if outer_l == '(' and outer_r == ')':
+                return not self._span_has_comma(l_line, l_col, r_line, r_col)
+            return False
+
+        # For assignments/comparisons: x = (y) or x in (y)
+        if is_comp_assign:
+            return not self._span_has_comma(l_line, l_col, r_line, r_col)
+
         return False
 
     def _span_has_comma(self, s_line, s_col, e_line, e_col):
-        """Checks if a comma exists between two coordinates without joining lines."""
-        for l_idx in range(s_line - 1, e_line):
-            line_text = self.lines[l_idx]
-            start = s_col if l_idx == s_line - 1 else 0
-            end = e_col if l_idx == e_line - 1 else len(line_text)
-            if ',' in line_text[start:end]:
+        """Checks for a comma between two points in self.lines."""
+        for idx in range(s_line - 1, e_line):
+            line = self.lines[idx]
+            start = s_col if idx == s_line - 1 else 0
+            end = e_col if idx == e_line - 1 else len(line)
+            if ',' in line[start:end]:
                 return True
         return False
