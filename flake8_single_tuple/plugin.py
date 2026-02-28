@@ -23,115 +23,80 @@ class SingleTupleChecker(ast.NodeVisitor):
             return
 
         self.token_starts = [t.start for t in self.tokens]
-
         self.visit(self.tree)
-
         yield from self.violations
 
     # ------------------------------------------------------------------
-    # Visitor methods — using NodeVisitor gives us proper traversal
-    # control and avoids cascading/duplicate reports.
+    # Visitor methods
     # ------------------------------------------------------------------
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        if node.value is not None:
-            self._check_candidate(node.value, is_call=False)
+        # Only flag bare string literal assignments: x = ("foo") or x = (f"...")
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            self._check_candidate(node.value, in_membership=False)
+        elif isinstance(node.value, ast.JoinedStr):  # f-string
+            self._check_candidate(node.value, in_membership=False)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        if node.value is not None:
-            self._check_candidate(node.value, is_call=False)
-        self.generic_visit(node)
-
-    def visit_Return(self, node: ast.Return) -> None:
-        if node.value is not None:
-            self._check_candidate(node.value, is_call=False)
-        self.generic_visit(node)
-
-    def visit_Yield(self, node: ast.Yield) -> None:
-        if node.value is not None:
-            self._check_candidate(node.value, is_call=False)
-        self.generic_visit(node)
-
-    def visit_Assert(self, node: ast.Assert) -> None:
-        # node.test is the asserted expression; node.msg is the optional message.
-        # Flagging these would be noisy and often wrong, so we only visit children.
+        if node.value is None:
+            self.generic_visit(node)
+            return
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            self._check_candidate(node.value, in_membership=False)
+        elif isinstance(node.value, ast.JoinedStr):
+            self._check_candidate(node.value, in_membership=False)
         self.generic_visit(node)
 
     def visit_Compare(self, node: ast.Compare) -> None:
-        # Check the left-hand side: ("A") in x
-        if any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops):
-            self._check_candidate(node.left, is_call=False)
+        has_membership = any(isinstance(op, (ast.In, ast.NotIn)) for op in node.ops)
 
-        # Check the right-hand side: x in ("A")
+        if has_membership:
+            self._check_candidate(node.left, in_membership=True)
+
         for op, comp in zip(node.ops, node.comparators):
             if isinstance(op, (ast.In, ast.NotIn)):
-                self._check_candidate(comp, is_call=False)
+                self._check_candidate(comp, in_membership=True)
 
-        self.generic_visit(node)
-
-    def visit_Call(self, node: ast.Call) -> None:
-        for arg in node.args:
-            # GeneratorExp inside a call like sum(x for x in y) is intentional;
-            # the outer parens belong to the call itself, not a grouping.
-            if isinstance(arg, ast.GeneratorExp):
-                continue
-            self._check_candidate(arg, is_call=True)
-        # Do NOT call self.generic_visit here with a blanket check; instead let
-        # the visitor descend naturally so nested calls are visited individually.
         self.generic_visit(node)
 
     # ------------------------------------------------------------------
     # Core check
     # ------------------------------------------------------------------
 
-    def _check_candidate(self, node: ast.expr, is_call: bool) -> None:
+    def _check_candidate(self, node: ast.expr, in_membership: bool) -> None:
         if not isinstance(node, ast.expr):
             return
 
-        # Allow ternary expressions — parens often aid readability.
         if isinstance(node, ast.IfExp):
             return
 
-        # Allow binary operations — parens may express intentional grouping.
-        if isinstance(node, ast.BinOp):
+        # BoolOp (and/or): type checkers already flag `x in (a and b)` as a
+        # type error (bool isn't iterable). No need to double-warn.
+        if isinstance(node, ast.BoolOp):
             return
 
-        # GeneratorExp and Lambda are intentionally NOT excluded here.
-        #
-        # GeneratorExp: Python's AST sets col_offset to point *inside* the implicit
-        # surrounding paren, so `x = (i for i in y)` naturally passes through
-        # _check_violation without a false positive — the token before `i` is `(`,
-        # but it's the genexp's own required paren and _check_violation won't find
-        # a comma-free outer pair wrapping it. However `x = ((i for i in y))`
-        # correctly flags the redundant outer pair.
-        #
-        # Lambda: `x = (lambda x: x+1)` is a genuine redundant grouping and should
-        # be flagged just like any other single-expression parenthesisation.
-        #
-        # The one real GeneratorExp exception is inside a *call* — `sum(x for x in y)`
-        # — where the call's own parens serve as the genexp's parens. That is handled
-        # by skipping GeneratorExp nodes in visit_Call before reaching this method.
+        # BinOp: excluded in assignment context (legitimate grouping), but
+        # flagged in membership — `x in (a + b)` looks like a missed comma.
+        if isinstance(node, ast.BinOp) and not in_membership:
+            return
+
+        # For BinOp nodes the paren span will naturally contain operators at
+        # depth 0 (the +, -, etc. that are part of the expression). We must
+        # skip the single-expression span check in that case — the AST already
+        # tells us this is one node, so we trust end_idx rather than rescanning.
+        skip_span_check = isinstance(node, ast.BinOp)
 
         start_idx = self._find_token_idx(node.lineno, node.col_offset, exact=True)
         if start_idx is None:
             return
 
-        # Resolve the true end boundary: find the last token that belongs to
-        # this node by searching for the first token *after* the node's end
-        # position, then stepping back one.
         end_lineno = getattr(node, "end_lineno", node.lineno)
         end_col = getattr(node, "end_col_offset", node.col_offset)
         after_end_idx = self._find_token_idx(end_lineno, end_col, exact=False)
-        # The last token of the node is the one just before after_end_idx.
-        # If exact=False returned the index of a token exactly at (end_lineno, end_col),
-        # that token is the first one *outside* the node span, so step back by 1.
-        if after_end_idx is None:
-            end_idx = len(self.tokens) - 1
-        else:
-            end_idx = after_end_idx - 1
+        end_idx = len(self.tokens) - 1 if after_end_idx is None else after_end_idx - 1
 
-        violation_idx = self._check_violation(start_idx, end_idx, is_call)
+        violation_idx = self._check_violation(start_idx, end_idx, skip_span_check)
         if violation_idx is not None:
             v_tok = self.tokens[violation_idx]
             self.violations.append((v_tok.start[0], v_tok.start[1], self.STC001, type(self)))
@@ -141,13 +106,6 @@ class SingleTupleChecker(ast.NodeVisitor):
     # ------------------------------------------------------------------
 
     def _find_token_idx(self, line: int, col: int, exact: bool = True) -> Optional[int]:
-        """
-        Binary-search the pre-sorted token start list.
-
-        exact=True  → returns the index only if a token starts exactly at (line, col).
-        exact=False → returns the index of the first token at or after (line, col),
-                      which lets callers resolve node-end boundaries without an O(N) scan.
-        """
         idx = bisect.bisect_left(self.token_starts, (line, col))
         if idx >= len(self.token_starts):
             return None
@@ -156,7 +114,6 @@ class SingleTupleChecker(ast.NodeVisitor):
         return idx
 
     def _next_meaningful(self, start_idx: int, step: int) -> Tuple[Optional[object], Optional[int]]:
-        """Walk forward (step=+1) or backward (step=-1) skipping whitespace/comments."""
         curr = start_idx + step
         while 0 <= curr < len(self.tokens):
             tok = self.tokens[curr]
@@ -173,7 +130,6 @@ class SingleTupleChecker(ast.NodeVisitor):
         return None, None
 
     def _find_matching_paren(self, open_idx: int) -> Optional[int]:
-        """Return the index of the closing ')' that matches tokens[open_idx]."""
         depth = 0
         for i in range(open_idx, len(self.tokens)):
             s = self.tokens[i].string
@@ -186,7 +142,6 @@ class SingleTupleChecker(ast.NodeVisitor):
         return None
 
     def _span_has_comma(self, open_idx: int, close_idx: int) -> bool:
-        """Return True if there is a top-level comma between open_idx and close_idx."""
         depth = 0
         for i in range(open_idx + 1, close_idx):
             s = self.tokens[i].string
@@ -198,42 +153,83 @@ class SingleTupleChecker(ast.NodeVisitor):
                 return True
         return False
 
-    def _check_violation(self, start_idx: int, end_idx: int, is_call: bool) -> Optional[int]:
+    def _span_has_implicit_string_join(self, open_idx: int, close_idx: int) -> bool:
         """
-        Return the token index of the opening '(' that wraps the node if it is a
-        redundant single-element grouping, or None otherwise.
+        Return True if the span contains more than one string token at depth 0,
+        indicating an implicit string concatenation that needs the parens.
+        """
+        depth = 0
+        string_count = 0
+        for i in range(open_idx + 1, close_idx):
+            tok = self.tokens[i]
+            if tok.string == "(":
+                depth += 1
+            elif tok.string == ")":
+                depth -= 1
+            elif tok.type == tokenize.STRING and depth == 0:
+                string_count += 1
+                if string_count > 1:
+                    return True
+        return False
 
-        For call arguments (is_call=True) the node is already inside the call's
-        own parens, so we need to find a *second* wrapping pair:
-            func((x))   ← the outer '(' belongs to the call, inner '(' is the issue
+    def _span_is_single_expression(self, open_idx: int, close_idx: int) -> bool:
         """
-        # The token immediately before the node should be '('
+        Return True if the paren span contains exactly one logical item at depth 0.
+        Any operator or keyword alongside the candidate means the parens are grouping
+        multiple things — not wrapping a single value.
+
+        Catches: (x in items and y in items)
+        where `x` is a valid Compare LHS but the outer parens belong to a
+        compound boolean, not a single-item tuple context.
+
+        Not applied to BinOp candidates — their spans naturally contain operators
+        that are part of the single expression itself.
+        """
+        _KEYWORD_OPERATORS = frozenset({
+            "and", "or", "not", "in", "is", "if", "else", "for", "lambda",
+        })
+        _SYMBOL_OPERATORS = frozenset({
+            "+", "-", "*", "/", "//", "%", "**", "@",
+            "&", "|", "^", "~", "<<", ">>",
+            "<", ">", "<=", ">=", "==", "!=",
+            "->",
+        })
+        depth = 0
+        for i in range(open_idx + 1, close_idx):
+            tok = self.tokens[i]
+            if tok.string == "(":
+                depth += 1
+            elif tok.string == ")":
+                depth -= 1
+            elif depth == 0:
+                if tok.type == tokenize.NAME and tok.string in _KEYWORD_OPERATORS:
+                    return False
+                if tok.type == tokenize.OP and tok.string in _SYMBOL_OPERATORS:
+                    return False
+        return True
+
+    def _check_violation(self, start_idx: int, end_idx: int, skip_span_check: bool = False) -> Optional[int]:
         prev_tok, prev_idx = self._next_meaningful(start_idx, -1)
         if prev_tok is None or prev_tok.string != "(":
             return None
 
-        if is_call:
-            # For call args, prev_idx is the call's own opening paren.
-            # There must be yet another '(' before that for a real violation.
-            outer_tok, outer_idx = self._next_meaningful(prev_idx, -1)
-            if outer_tok is None or outer_tok.string != "(":
-                return None
-            search_idx = outer_idx
-        else:
-            search_idx = prev_idx
-
+        search_idx = prev_idx
         closing_idx = self._find_matching_paren(search_idx)
         if closing_idx is None:
             return None
 
-        # The closing paren must come *after* the last token of the node.
-        # Previously the code used `closing_idx < end_idx` which was an
-        # off-by-one: end_idx is the last token *inside* the node, so the
-        # closing paren must be strictly greater than end_idx.
         if closing_idx <= end_idx:
             return None
 
-        if not self._span_has_comma(search_idx, closing_idx):
-            return search_idx
+        if self._span_has_comma(search_idx, closing_idx):
+            return None
 
-        return None
+        if self._span_has_implicit_string_join(search_idx, closing_idx):
+            return None
+
+        # BinOp candidates skip the span check — their own operators are part
+        # of the single expression and would incorrectly trip the guard.
+        if not skip_span_check and not self._span_is_single_expression(search_idx, closing_idx):
+            return None
+
+        return search_idx
